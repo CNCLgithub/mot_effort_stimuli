@@ -53,3 +53,19 @@ function report(stats::RunningStats, ms::Metrics)
 
     Dict{Symbol, Tuple}(zip(ms.names, zip(mus, sds)))
 end
+
+function smooth(xs::Vector{Float64}, w::Int64)
+    n = length(xs)
+    ys = zeros(length(xs))
+    w = isodd(w) ? w : w + 1
+    hw = Int64((w + 1) / 2)
+    @inbounds for i = 1:n
+        c = 0
+        for j = max(1, i - hw + 1):min(n, i + hw - 1)
+            ys[i] += xs[j]
+            c += 1
+        end
+        ys[i] *= 1.0 / c
+    end
+    return ys
+end

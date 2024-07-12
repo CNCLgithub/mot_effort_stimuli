@@ -26,7 +26,7 @@ function main()
     isdir(outpath) || mkdir(outpath)
 
     ntrials = length(dataset)
-    for i = 1:ntrials
+    Threads.@threads for i = 1:ntrials
         positions = dataset[i]["positions"]
         states = state_from_positions(wm, positions, targets)
         scene_path = "$(outpath)/$(i)"

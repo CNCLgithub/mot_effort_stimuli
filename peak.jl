@@ -2,17 +2,18 @@ using Gen
 using CSV
 using JSON
 using MOTCore
-using MOTCore: scholl_delta
+using MOTCore: scholl_delta, scholl_init
 using DataFrames
-using UnicodePlots
 using FillArrays
+using UnicodePlots
+using StaticArrays
 using Statistics: mean
 using LinearAlgebra: norm
 using Accessors: setproperties
 
 include("running_stats.jl")
 
-function trial_to_dict(states::Vector)
+function trial_to_dict(states::AbstractVector{T}) where {T<:SchollState}
     positions = map(states) do state
         map(state.objects) do dot
             get_pos(dot)
@@ -38,39 +39,109 @@ end
 
 function gen_trial(wm::SchollWM, targets,
                    metrics::Metrics,
-                   max_steps::Int64 = 3000)
-    nsteps = length(targets)
-    sofar = Vector{SchollState}(undef, nsteps)
-    nmetrics = length(metrics.funcs)
-    vals = Matrix{Float64}(undef, nmetrics, nsteps)
-    current_step = 1
-    block_idx = 1
-    prev = burnin(wm, 12)
+                   rejuv_steps::Int64 = 100,
+                   particles = 10)
+    nsteps = size(targets, 2)
+    pf = initialize_particle_filter(peak_chain, (0, wm, metrics),
+                                    choicemap(), particles)
+    obj = 1
     for i = 1:nsteps
-        m = targets[i]
-        best_st = cur_st = scholl_kernel(1, prev, wm)
-        best_ms = cur_ms = metrics((cur_st,))
-        best_r = cur_r = resid = sum(abs.(m - cur_ms))
-        t = 1
-        while t < max_steps && !isapprox(resid, 0.)
-            sample_st = scholl_kernel(1, prev, wm)
-            sample_ms = metrics((sample_st,))
-            sample_r = sum(abs.(sample_ms - m))
-            # MH accept
-            if log(rand()) < log(cur_r) - log(sample_r)
-                cur_st = sample_st
-                cur_ms = sample_ms
-                cur_r = sample_r
-                if sample_r < best_r
-                    best_st = sample_st
-                    best_ms = sample_ms
-                    best_r = sample_r
+        obs = choicemap((:states => i => :metrics,  targets[:, i]),
+                        (:states => i => :pos_var, 1.0))
+        particle_filter_step!(pf,
+                              (i, wm, metrics),
+                              (UnknownChange(), NoChange(), NoChange()),
+                              obs)
+        maybe_resample!(pf)
+        if i % 5 == 0
+            obj = categorical(Fill(1.0 / wm.n_dots, wm.n_dots))
+        end
+        Threads.@threads for p = 1:particles
+            for _ = 1:rejuv_steps
+                new_tr, w = regenerate(pf.traces[p],
+                                    Gen.select(:states => i => :deltas => obj))
+                if log(rand()) < w
+                    pf.traces[p] = new_tr
+                    pf.log_weights[p] += w
                 end
             end
-            t += 1
         end
-        prev = sofar[i] = best_st
-        vals[:, i] = best_ms
+    end
+    # Extract MAP
+    best_idx = argmax(get_log_weights(pf))
+    best_tr = pf.traces[best_idx]
+    (_, sofar) = get_retval(best_tr)
+    nmetrics = length(metrics.funcs)
+    vals = Vector{SVector{nmetrics, Float64}}(undef, nsteps)
+    for i = 1:nsteps
+        vals[i] = SVector{nmetrics, Float64}(metrics((sofar[i],)))
+    end
+    return best_tr, sofar, vals
+end
+
+
+function gen_trough_trial(trace::Gen.Trace,
+                          mid_start::Int, mid_end::Int,
+                          wm::SchollWM, targets,
+                          metrics::Metrics,
+                          rejuv_steps::Int64 = 100,
+                          particles = 10)
+    nsteps = size(targets, 2)
+    # choices = choicemap(get_choices(trace))
+    choices = get_choices(trace)
+    init_cm = get_selected(choices, Gen.select(:init_state))
+    pf = initialize_particle_filter(peak_chain, (0, wm, metrics),
+                                    init_cm, particles)
+    obj = 1
+    for i = 1:nsteps
+        obs = choicemap()
+        # obs[:states => i => :metrics] = targets[:, i]
+        # if i < mid_end
+        #     obs[:states => i => :metrics] = targets[:, i]
+        # end
+        # add constraint from previous trace
+        if i < mid_start
+            set_submap!(obs,
+                        :states => i => :deltas,
+                        get_submap(choices, :states => i => :deltas))
+        else
+            obs[:states => i => :metrics] = targets[:, i]
+        end
+
+        if i > mid_end
+            obs[:states => i => :positions] =
+                choices[:states => i => :positions]
+            obs[:states => i => :pos_var] = 100 * exp(0.25*(mid_end - i))
+        end
+        particle_filter_step!(pf,
+                              (i, wm, metrics),
+                              (UnknownChange(), NoChange(), NoChange()),
+                              obs)
+        i < mid_start && continue # don't do inference
+        maybe_resample!(pf)
+
+        if i % 5 == 0
+            obj = categorical(Fill(1.0 / wm.n_dots, wm.n_dots))
+        end
+        Threads.@threads for p = 1:particles
+            for _ = 1:rejuv_steps
+                new_tr, w = regenerate(pf.traces[p],
+                                    Gen.select(:states => i => :deltas => obj))
+                if log(rand()) < w
+                    pf.traces[p] = new_tr
+                    pf.log_weights[p] += w
+                end
+            end
+        end
+    end
+    # Extract MAP
+    best_idx = argmax(get_log_weights(pf))
+    best_tr = pf.traces[best_idx]
+    (_, sofar) = get_retval(best_tr)
+    nmetrics = length(metrics.funcs)
+    vals = Vector{SVector{nmetrics, Float64}}(undef, nsteps)
+    for i = 1:nsteps
+        vals[i] = SVector{nmetrics, Float64}(metrics((sofar[i],)))
     end
     return sofar, vals
 end
@@ -149,13 +220,34 @@ function warmup(wm::SchollWM, metrics::Metrics,
     report(stats, metrics)
 end
 
+function extract_positions(st::SchollState)
+    n = length(st.objects)
+    result = Vector{Float64}(undef, 2 * n)
+    @inbounds for i = 1:n
+        x, y = get_pos(st.objects[i])
+        result[(2 * (i - 1) + 1)] = x
+        result[(2 * i)] = y
+    end
+    return result
+end
+
 @gen static function peak_kernel(t::Int, prev::SchollState,
                                  wm::SchollWM, metrics::Metrics)
     deltas ~ Gen.Map(scholl_delta)(Fill(wm, wm.n_dots))
-    next::SchollState = step(wm, prev_st, deltas)
-    mus = metrics(next)
-    metrics ~ broadcasted_normal(mus, 1.0)
+    next::SchollState = MOTCore.step(wm, prev, deltas)
+    mus = metrics((next,))
+    pos = extract_positions(next)
+    metrics ~ broadcasted_normal(mus, 1.5)
+    pos_var ~ uniform(0.0, 100.0)
+    positions ~ broadcasted_normal(pos, 1.0)
     return next
+end
+
+@gen static function peak_chain(k::Int, wm::SchollWM, metrics::Metrics)
+    init_state ~ scholl_init(wm)
+    states ~ Gen.Unfold(peak_kernel)(k, init_state, wm, metrics)
+    result = (init_state, states)
+    return result
 end
 
 function test()
@@ -171,17 +263,18 @@ function test()
                   vel=2.75,
                   vel_min = 2.0,
                   vel_max = 3.75,
-                  vel_step = 2.00,
+                  vel_step = 1.00,
                   vel_prob = 0.20
     )
 
     # dataset parameters
-    ntrials = 4
-    nexamples = 0
+    nscenes = 10
+    ntrials = nscenes * 2
+    nexamples = 4
     epoch_dur = 3 # seconds
     fps = 24 # frames per second
     epoch_frames = epoch_dur * fps
-    tot_frames = 5 * epoch_frames # 3 epochs total
+    tot_frames = 5 * epoch_frames # 5 epochs total
 
 
     metrics = Metrics(
@@ -197,16 +290,16 @@ function test()
     ecc_mu, _ = stats[:ecc]
     nd_mu = 50.0
 
-    delta_d = -2.5
-    delta_e = 5.0
+    delta_d = -3.0
+    delta_e = 3.0
     delta_m = 0.5 * (delta_d + delta_e)
 
-    D = [max(0.0, tdd_mu + delta_d * tdd_sd), ecc_mu, nd_mu]
-    M = [tdd_mu + delta_m * tdd_sd, ecc_mu, nd_mu]
-    E = [tdd_mu + delta_e * tdd_sd, ecc_mu, nd_mu]
+    H = [max(0.0, tdd_mu + delta_d * tdd_sd); ecc_mu; nd_mu]
+    M = [tdd_mu + delta_m * tdd_sd; ecc_mu; nd_mu]
+    E = [tdd_mu + delta_e * tdd_sd; ecc_mu; nd_mu]
 
     @show stats
-    @show D
+    @show H
     @show M
     @show E
 
@@ -217,55 +310,91 @@ function test()
     isdir(base) || mkdir(base)
 
     perms = [
-        [M, M, E, M, M],
-        [M, M, D, M, M],
+        hcat(E,E,H,E,E),
+        hcat(E,M,M,E,E),
     ]
 
-    df = DataFrame(:scene => Int32[],
-                   :epoch => Int32[],
+    df = DataFrame(:scene => UInt8[],
+                   :peak => Bool[],
+                   :frame => UInt32[],
                    :tdd => Float32[],
                    :ecc => Float32[],
                    :nobj => Float32[]
                    )
-    # total of 12 trials
-    for i = 1:ntrials
-        perm = perms[i % 2 + 1]
-        ne = length(perm)
-        targets = repeat(perm, inner = epoch_frames)
-        trial, vals = gen_trial(wm, targets, metrics, 2000)
-        push!(dataset, trial)
-        push!(cond_list, [i, false])
-        # d = Dict(:scene => i,
-        #          :epoch => 1:ne)
 
-        @show map(first, perm)
+    # needed to add some padding because of smooth
+    window = 36
+    mid_start = Int(1 * epoch_frames + 1 - 0.5 * window)
+    mid_end = Int(3 * epoch_frames - 18)
+
+    peak_targets = repeat(perms[2],
+                          inner = (1, epoch_frames))
+    peak_targets[1, :] = smooth(peak_targets[1, :], window)
+    trough_targets = repeat(perms[1],
+                            inner = (1, epoch_frames))
+    trough_targets[1, :] = smooth(trough_targets[1, :], window)
+
+    # total of 12 trials
+    for i = 1:nscenes
+        trace, trial, vals =
+            gen_trial(wm, peak_targets, metrics, 20, 100)
+        push!(dataset, trial)
+        push!(cond_list, [(i - 1) * 2 + 1, false])
+        d = Dict(:scene => i,
+                 :peak => true,
+                 :frame => 1:tot_frames)
+
         for (mi, m) = enumerate(metrics.names)
+            vs = map(x -> x[mi], vals)
+            d[m] = vs
             plt = lineplot(1:tot_frames,
-                           map(x -> x[mi], targets),
+                           peak_targets[mi, :],
                            title = String(m),
                            xlabel = "time",
-                           name = "target"
+                           name = "target",
+                           ylim = (min(minimum(vs), H[mi]), E[mi])
                            )
-            lineplot!(plt, 1:tot_frames,
-                      vec(vals[mi, :]),
-                      name = "measured"
-                      )
+            lineplot!(plt, 1:tot_frames, vs, name = "measured")
             display(plt)
-            # vs = reshape(vals[mi, :], (epoch_frames, ne))
-            # d[m] = vec(mean(vs, dims = 1))
         end
-        # display(d)
-        # append!(df, d)
+        append!(df, d)
+
+        trial, vals =
+            gen_trough_trial(trace, mid_start, mid_end,
+                             wm, trough_targets, metrics, 20, 200)
+        push!(dataset, trial)
+        push!(cond_list, [i * 2, false])
+        d = Dict(:scene => i,
+                 :peak => false,
+                 :frame => 1:tot_frames)
+
+        for (mi, m) = enumerate(metrics.names)
+            vs = map(x -> x[mi], vals)
+            d[m] = vs
+            plt = lineplot(1:tot_frames,
+                           trough_targets[mi, :],
+                           title = String(m),
+                           xlabel = "time",
+                           name = "target",
+                           ylim = (min(minimum(vs), H[mi]), E[mi])
+                           )
+            lineplot!(plt, 1:tot_frames, vs, name = "measured")
+            display(plt)
+        end
+        append!(df, d)
+
     end
     write_dataset(dataset, "$(base)/dataset.json")
     write_condlist(cond_list, "$(base)/trial_list.json")
     CSV.write("$(base)/tdd.csv", df)
 
+    diffs = combine(groupby(df, Cols(:scene, :peak)),
+                    :tdd => mean)
+    display(diffs)
+
     for i = 1:nexamples
-        perm = perms[i % 2 + 1]
-        ne = length(perm)
-        targets = repeat(perm, inner = epoch_frames)
-        trial, vals = gen_trial(wm, targets, metrics, 1000)
+        targets = iseven(i) ? peak_targets : trough_targets
+        _, trial, vals = gen_trial(wm, targets, metrics, 20, 100)
         push!(examples, trial)
     end
     write_dataset(examples, "$(base)/examples.json")
