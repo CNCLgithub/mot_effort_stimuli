@@ -95,29 +95,26 @@ function gen_trough_trial(trace::Gen.Trace,
     obj = 1
     for i = 1:nsteps
         obs = choicemap()
-        # obs[:states => i => :metrics] = targets[:, i]
-        # if i < mid_end
-        #     obs[:states => i => :metrics] = targets[:, i]
-        # end
-        # add constraint from previous trace
+        # Stage 1: match initial positions
         if i < mid_start
             set_submap!(obs,
                         :states => i => :deltas,
                         get_submap(choices, :states => i => :deltas))
         else
+            # Stages 2 + 3 metrics
             obs[:states => i => :metrics] = targets[:, i]
-        end
-
-        if i > mid_end
+            # Track positions loosely in Stage 2
             obs[:states => i => :positions] =
                 choices[:states => i => :positions]
-            obs[:states => i => :pos_var] = 100 * exp(0.25*(mid_end - i))
+            pos_var = i > mid_end ? 1.0 : 50 / log(i - mid_start + 2)
+            obs[:states => i => :pos_var] = pos_var
         end
+
         particle_filter_step!(pf,
                               (i, wm, metrics),
                               (UnknownChange(), NoChange(), NoChange()),
                               obs)
-        i < mid_start && continue # don't do inference
+        i < mid_start && continue # don't optimize Stage 1
         maybe_resample!(pf)
 
         if i % 5 == 0
@@ -237,9 +234,9 @@ end
     next::SchollState = MOTCore.step(wm, prev, deltas)
     mus = metrics((next,))
     pos = extract_positions(next)
-    metrics ~ broadcasted_normal(mus, 1.5)
-    pos_var ~ uniform(0.0, 100.0)
-    positions ~ broadcasted_normal(pos, 1.0)
+    metrics ~ broadcasted_normal(mus, 1.0)
+    pos_var ~ uniform(0.0, 1000.0)
+    positions ~ broadcasted_normal(pos, pos_var)
     return next
 end
 
@@ -323,32 +320,33 @@ function test()
                    )
 
     # needed to add some padding because of smooth
-    window = 36
+    window = 24
     mid_start = Int(1 * epoch_frames + 1 - 0.5 * window)
-    mid_end = Int(3 * epoch_frames - 18)
+    mid_end = Int(3 * epoch_frames + 0.5 * window)
+    # mid_end = Int(3 * epoch_frames - 18)
 
-    peak_targets = repeat(perms[2],
+    peak_targets = repeat(perms[1],
                           inner = (1, epoch_frames))
     peak_targets[1, :] = smooth(peak_targets[1, :], window)
-    trough_targets = repeat(perms[1],
+    trough_targets = repeat(perms[2],
                             inner = (1, epoch_frames))
     trough_targets[1, :] = smooth(trough_targets[1, :], window)
 
     # total of 12 trials
     for i = 1:nscenes
         trace, trial, vals =
-            gen_trial(wm, peak_targets, metrics, 20, 100)
+            gen_trial(wm, trough_targets, metrics, 20, 100)
         push!(dataset, trial)
         push!(cond_list, [(i - 1) * 2 + 1, false])
         d = Dict(:scene => i,
-                 :peak => true,
+                 :peak => false,
                  :frame => 1:tot_frames)
 
         for (mi, m) = enumerate(metrics.names)
             vs = map(x -> x[mi], vals)
             d[m] = vs
             plt = lineplot(1:tot_frames,
-                           peak_targets[mi, :],
+                           trough_targets[mi, :],
                            title = String(m),
                            xlabel = "time",
                            name = "target",
@@ -361,18 +359,18 @@ function test()
 
         trial, vals =
             gen_trough_trial(trace, mid_start, mid_end,
-                             wm, trough_targets, metrics, 20, 200)
+                             wm, peak_targets, metrics, 20, 300)
         push!(dataset, trial)
         push!(cond_list, [i * 2, false])
         d = Dict(:scene => i,
-                 :peak => false,
+                 :peak => true,
                  :frame => 1:tot_frames)
 
         for (mi, m) = enumerate(metrics.names)
             vs = map(x -> x[mi], vals)
             d[m] = vs
             plt = lineplot(1:tot_frames,
-                           trough_targets[mi, :],
+                           peak_targets[mi, :],
                            title = String(m),
                            xlabel = "time",
                            name = "target",
