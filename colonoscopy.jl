@@ -1,8 +1,9 @@
 using Gen
 using CSV
 using JSON
-using DataFrames
 using MOTCore
+using DataFrames
+using UnicodePlots
 using Statistics: mean
 using LinearAlgebra: norm
 using Accessors: setproperties
@@ -182,17 +183,14 @@ end
 function test()
 
     dname = "colonoscopy_0.1"
+    pairs = 10
+    nexamples = 3
 
     wm = SchollWM(;
                   n_dots=8,
                   area_width = 720.0,
                   area_height = 480.0,
                   dot_radius = 20.0,
-                  # vel=2.75,
-                  # vel_min = 2.0,
-                  # vel_max = 3.75,
-                  # vel_step = 0.75,
-                  # vel_prob = 0.60
                   vel=3.75,
                   vel_min = 3.0,
                   vel_max = 4.75,
@@ -201,10 +199,9 @@ function test()
     )
 
     # dataset parameters
-    epoch_dur = 4 # seconds | x3 for total
+    epoch_dur = 3 # seconds | x3 for total
     fps = 24 # frames per second
     epoch_frames = epoch_dur * fps
-    # tot_frames = 5 * epoch_frames # 3 epochs total
 
 
     metrics = Metrics(
@@ -232,10 +229,9 @@ function test()
 
     dataset = []
     cond_list = []
-    base = "test/output/$(dname)"
+    base = "output/$(dname)"
     isdir(base) || mkdir(base)
 
-    pairs = 5
 
     df = DataFrame(:scene => Int32[],
                    :epoch => Int32[],
@@ -253,8 +249,9 @@ function test()
     for i = 1:pairs
         targets = repeat(perm, inner = epoch_frames)
         part_a, vals_a = gen_trial(wm, targets, metrics, 5000)
+        # extend with two Easy segments
         part_b, vals_b = extend_trial(wm, part_a,
-                                      fill(E, epoch_frames),
+                                      fill(E, 2 * epoch_frames),
                                       metrics, 5000)
 
         push!(dataset, part_a)
@@ -266,20 +263,27 @@ function test()
         trial += 2
 
         d = Dict(:scene => i,
-                 :epoch => 1:4)
+                 :epoch => 1:5)
 
         vals = hcat(vals_a, vals_b)
         for (mi, m) = enumerate(metrics.names)
-            vs = reshape(vals[mi, :], (epoch_frames, 4))
+            vs = reshape(vals[mi, :], (epoch_frames, 5))
             d[m] = vec(mean(vs, dims = 1))
         end
         display(d)
         append!(df, d)
     end
-    # write_dataset(dataset, "$(base)/examples.json")
     write_dataset(dataset, "$(base)/dataset.json")
     write_condlist(cond_list, "$(base)/trial_list.json")
     CSV.write("$(base)/tdd.csv", df)
+
+    examples = []
+    for i = 1:pairs
+        targets = repeat(perm, inner = epoch_frames)
+        part_a, vals_a = gen_trial(wm, targets, metrics, 5000)
+        push!(examples, part_a)
+    end
+    write_dataset(examples, "$(base)/examples.json")
 end
 
 test();

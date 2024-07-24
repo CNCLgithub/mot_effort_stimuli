@@ -2,7 +2,6 @@ using Gen
 using CSV
 using JSON
 using MOTCore
-using MOTCore: scholl_delta, scholl_init
 using DataFrames
 using FillArrays
 using UnicodePlots
@@ -10,6 +9,7 @@ using StaticArrays
 using Statistics: mean
 using LinearAlgebra: norm
 using Accessors: setproperties
+using MOTCore: scholl_delta, scholl_init
 
 include("running_stats.jl")
 
