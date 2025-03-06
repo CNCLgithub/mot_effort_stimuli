@@ -13,30 +13,6 @@ using MOTCore: scholl_delta, scholl_init
 
 include("running_stats.jl")
 
-function trial_to_dict(states::AbstractVector{T}) where {T<:SchollState}
-    positions = map(states) do state
-        map(state.objects) do dot
-            get_pos(dot)
-        end
-    end
-    Dict(:positions => positions)
-end
-
-function write_dataset(dataset::Vector, json_path::String)
-    out = map(trial_to_dict, dataset)
-    open(json_path, "w") do f
-        write(f, json(out))
-    end
-    return nothing
-end
-
-function write_condlist(condlist::Vector, path::String)
-    open(path, "w") do f
-        write(f, json(condlist))
-    end
-    return nothing
-end
-
 function gen_trial(wm::SchollWM, targets,
                    metrics::Metrics,
                    rejuv_steps::Int64 = 100,
@@ -143,79 +119,6 @@ function gen_trough_trial(trace::Gen.Trace,
     return sofar, vals
 end
 
-function nearest_obj(state::SchollState)
-    objects = state.objects
-    d = Inf
-    @inbounds for i = 1:7
-        tpos = get_pos(objects[i])
-        for j = (i+1):8
-            d = min(norm(tpos - get_pos(objects[j])), d)
-        end
-    end
-    clamp(d, 0., 45.) # prevent over-correction
-end
-
-function tddensity(state::SchollState)
-    # first 4 are targets
-    objects = state.objects
-    avg_tdd = 0.0
-    @inbounds for i = 1:4
-        tdd = Inf
-        tpos = get_pos(objects[i])
-        for j = 5:8
-            d = norm(tpos - get_pos(objects[j]))
-            avg_tdd += d
-        end
-    end
-    avg_tdd / 16
-end
-
-
-function tdmin(state::SchollState)
-    # first 4 are targets
-    objects = state.objects
-    tdd = Inf
-    @inbounds for i = 1:4
-        tpos = get_pos(objects[i])
-        for j = 5:8
-            # REVIEW: consider l1 distance
-            d = norm(tpos - get_pos(objects[j]))
-            tdd = min(tdd, d)
-        end
-    end
-    tdd
-end
-
-function eccentricity(state::SchollState)
-    # first 4 are targets
-    objects = state.objects
-    no = length(objects)
-    val = 0.0
-    @inbounds for i = 1:no
-        # tdd = Inf
-        val += norm(get_pos(objects[i]))
-    end
-    2 * (val / no)
-end
-
-function burnin(wm::SchollWM, steps::Int64)
-    state = scholl_init(wm)
-    for t = 1:steps
-        state = scholl_kernel(t, state, wm)
-    end
-    return state
-end
-
-function warmup(wm::SchollWM, metrics::Metrics,
-                k::Int64=240, n::Int64=1000)
-    stats = RunningStats(metrics)
-    for _ = 1:n
-        state = burnin(wm, 12)
-        part = scholl_chain(k, state, wm)
-        stride!(stats, metrics, (part,))
-    end
-    report(stats, metrics)
-end
 
 function extract_positions(st::SchollState)
     n = length(st.objects)

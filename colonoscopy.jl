@@ -2,6 +2,7 @@ using Gen
 using CSV
 using JSON
 using MOTCore
+using FillArrays
 using DataFrames
 using UnicodePlots
 using Statistics: mean
@@ -10,179 +11,123 @@ using Accessors: setproperties
 
 include("running_stats.jl")
 
-function trial_to_dict(states::Vector)
-    positions = map(states) do state
-        map(state.objects) do dot
-            get_pos(dot)
-        end
-    end
-    Dict(:positions => positions)
-end
-
-function write_dataset(dataset::Vector, json_path::String)
-    out = map(trial_to_dict, dataset)
-    open(json_path, "w") do f
-        write(f, json(out))
-    end
-    return nothing
-end
-
-function write_condlist(condlist::Vector, path::String)
-    open(path, "w") do f
-        write(f, json(condlist))
-    end
-    return nothing
-end
-
 function gen_trial(wm::SchollWM, targets,
                    metrics::Metrics,
-                   max_steps::Int64 = 3000)
-    nsteps = length(targets)
-    sofar = Vector{SchollState}(undef, nsteps)
-    nmetrics = length(metrics.funcs)
-    vals = Matrix{Float64}(undef, nmetrics, nsteps)
-    current_step = 1
-    block_idx = 1
-    prev = burnin(wm, 12)
+                   rejuv_steps::Int64 = 100,
+                   particles = 10)
+    nsteps = size(targets, 2)
+    pf = initialize_particle_filter(col_chain, (0, wm, metrics),
+                                    choicemap(), particles)
+    obj = 1
     for i = 1:nsteps
-        m = targets[i]
-        # println("$(i): $(first(m))")
-        st = i == 1 ? burnin(wm, 12) : scholl_kernel(1, prev, wm)
-        xs = metrics((st,))
-        rxs = sum(abs.(xs - m))
-        t = 1
-        while t < max_steps && !isapprox(rxs, 0.)
-            _st = i == 1 ? burnin(wm, 12) : scholl_kernel(1, prev, wm)
-            vs = metrics((_st,))
-            rvs = sum(abs.(vs - m))
-            if rxs > rvs # log(1) < log(rxs) - log(rvs)
-                st = _st
-                xs = vs
-                rxs = rvs
-            end
-            t += 1
+        obs = choicemap((:states => i => :metrics,  targets[:, i]))
+        particle_filter_step!(pf,
+                              (i, wm, metrics),
+                              (UnknownChange(), NoChange(), NoChange()),
+                              obs)
+        maybe_resample!(pf)
+        if i % 5 == 0
+            obj = categorical(Fill(1.0 / wm.n_dots, wm.n_dots))
         end
-        sofar[i] = st
-        vals[:, i] = xs
-        # println("  $(first(xs))")
-        prev = st
+        Threads.@threads for p = 1:particles
+            for _ = 1:rejuv_steps
+                new_tr, w = regenerate(pf.traces[p],
+                                    Gen.select(:states => i => :deltas => obj))
+                if log(rand()) < w
+                    pf.traces[p] = new_tr
+                    pf.log_weights[p] += w
+                end
+            end
+        end
     end
-    return sofar, vals
+    # Extract MAP
+    best_idx = argmax(get_log_weights(pf))
+    best_tr = pf.traces[best_idx]
+    (_, sofar) = get_retval(best_tr)
+    nmetrics = length(metrics.funcs)
+    vals = Vector{SVector{nmetrics, Float64}}(undef, nsteps)
+    for i = 1:nsteps
+        vals[i] = SVector{nmetrics, Float64}(metrics((sofar[i],)))
+    end
+    return best_tr, sofar, vals
 end
 
-function extend_trial(wm::SchollWM,
-                      prev::Vector{SchollState},
-                      targets,
+
+function extend_trial(trace::Gen.Trace,
+                      new_phase::Int,
+                      wm::SchollWM, targets,
                       metrics::Metrics,
-                      max_steps::Int64 = 3000)
-    nsteps = length(targets)
-    sofar = Vector{SchollState}(undef, nsteps)
-    nmetrics = length(metrics.funcs)
-    vals = Matrix{Float64}(undef, nmetrics, nsteps)
-    current_step = 1
-    block_idx = 1
-    prev_st = last(prev)
+                      rejuv_steps::Int64 = 100,
+                      particles = 10)
+    nsteps = size(targets, 2)
+    # choices = choicemap(get_choices(trace))
+    choices = get_choices(trace)
+    init_cm = get_selected(choices, Gen.select(:init_state))
+    pf = initialize_particle_filter(col_chain, (0, wm, metrics),
+                                    init_cm, particles)
+    obj = 1
     for i = 1:nsteps
-        m = targets[i]
-        st = scholl_kernel(1, prev_st, wm)
-        xs = metrics((st,))
-        rxs = sum(abs.(xs - m))
-        t = 1
-        while t < max_steps && !isapprox(rxs, 0.)
-            _st = scholl_kernel(1, prev_st, wm)
-            vs = metrics((_st,))
-            rvs = sum(abs.(vs - m))
-            if rxs > rvs # log(1) < log(rxs) - log(rvs)
-                st = _st
-                xs = vs
-                rxs = rvs
-            end
-            t += 1
+        obs = choicemap()
+        # Stage 1: match initial positions
+        addr = :states => i => :deltas
+        if has_submap(choices, addr)
+            set_submap!(obs, addr, get_submap(choices, addr))
+        else
+            # Stages 2 + 3 metrics
+            obs[:states => i => :metrics] = targets[:, i]
         end
-        sofar[i] = st
-        vals[:, i] = xs
-        prev_st = st
+        particle_filter_step!(pf,
+                              (i, wm, metrics),
+                              (UnknownChange(), NoChange(), NoChange()),
+                              obs)
+        i < new_phase && continue # don't optimize Stage 1
+        maybe_resample!(pf)
+
+        if i % 5 == 0
+            obj = categorical(Fill(1.0 / wm.n_dots, wm.n_dots))
+        end
+        Threads.@threads for p = 1:particles
+            for _ = 1:rejuv_steps
+                new_tr, w = regenerate(pf.traces[p],
+                                    Gen.select(:states => i => :deltas => obj))
+                if log(rand()) < w
+                    pf.traces[p] = new_tr
+                    pf.log_weights[p] += w
+                end
+            end
+        end
+    end
+    # Extract MAP
+    best_idx = argmax(get_log_weights(pf))
+    best_tr = pf.traces[best_idx]
+    (_, sofar) = get_retval(best_tr)
+    nmetrics = length(metrics.funcs)
+    vals = Vector{SVector{nmetrics, Float64}}(undef, nsteps)
+    for i = 1:nsteps
+        vals[i] = SVector{nmetrics, Float64}(metrics((sofar[i],)))
     end
     return sofar, vals
 end
 
-function nearest_obj(state::SchollState)
-    objects = state.objects
-    d = Inf
-    @inbounds for i = 1:7
-        tpos = get_pos(objects[i])
-        for j = (i+1):8
-            d = min(norm(tpos - get_pos(objects[j])), d)
-        end
-    end
-    clamp(d, 0., 45.) # prevent over-correction
+@gen static function col_kernel(t::Int, prev::SchollState,
+                                 wm::SchollWM, metrics::Metrics)
+    deltas ~ Gen.Map(scholl_delta)(Fill(wm, wm.n_dots))
+    next::SchollState = MOTCore.step(wm, prev, deltas)
+    mus = metrics((next,))
+    metrics ~ broadcasted_normal(mus, 1.0)
+    return next
 end
 
-function tddensity(state::SchollState)
-    # first 4 are targets
-    objects = state.objects
-    avg_tdd = 0.0
-    @inbounds for i = 1:4
-        tdd = Inf
-        tpos = get_pos(objects[i])
-        for j = 5:8
-            d = norm(tpos - get_pos(objects[j]))
-            avg_tdd += d
-        end
-    end
-    avg_tdd / 16
-end
-
-
-function tdmin(state::SchollState)
-    # first 4 are targets
-    objects = state.objects
-    tdd = Inf
-    @inbounds for i = 1:4
-        tpos = get_pos(objects[i])
-        for j = 5:8
-            # REVIEW: consider l1 distance
-            d = norm(tpos - get_pos(objects[j]))
-            tdd = min(tdd, d)
-        end
-    end
-    tdd
-end
-
-function eccentricity(state::SchollState)
-    # first 4 are targets
-    objects = state.objects
-    no = length(objects)
-    val = 0.0
-    @inbounds for i = 1:no
-        # tdd = Inf
-        val += norm(get_pos(objects[i]))
-    end
-    2 * (val / no)
-end
-
-function burnin(wm::SchollWM, steps::Int64)
-    state = scholl_init(wm)
-    for t = 1:steps
-        state = scholl_kernel(t, state, wm)
-    end
-    return state
-end
-
-function warmup(wm::SchollWM, metrics::Metrics,
-                k::Int64=240, n::Int64=1000)
-    stats = RunningStats(metrics)
-    for _ = 1:n
-        state = burnin(wm, 12)
-        part = scholl_chain(k, state, wm)
-        stride!(stats, metrics, (part,))
-    end
-    report(stats, metrics)
+@gen static function col_chain(k::Int, wm::SchollWM, metrics::Metrics)
+    init_state ~ scholl_init(wm)
+    states ~ Gen.Unfold(col_kernel)(k, init_state, wm, metrics)
+    result = (init_state, states)
+    return result
 end
 
 function test()
 
-    dname = "colonoscopy_0.1"
+    dname = "colonoscopy_0.3"
     pairs = 10
     nexamples = 3
 
@@ -191,17 +136,18 @@ function test()
                   area_width = 720.0,
                   area_height = 480.0,
                   dot_radius = 20.0,
-                  vel=3.75,
-                  vel_min = 3.0,
-                  vel_max = 4.75,
-                  vel_step = 0.75,
-                  vel_prob = 0.30
+                  vel=2.75,
+                  vel_min = 2.0,
+                  vel_max = 3.75,
+                  vel_step = 1.00,
+                  vel_prob = 0.20
     )
 
     # dataset parameters
     epoch_dur = 3 # seconds | x3 for total
     fps = 24 # frames per second
     epoch_frames = epoch_dur * fps
+    tot_frames = 5 * epoch_frames # 5 epochs total
 
 
     metrics = Metrics(
@@ -218,7 +164,7 @@ function test()
     nd_mu = 50.0
 
     delta_d = -2.5
-    delta_e = 5.0
+    delta_e = 3.0
 
     D = [max(0.0, tdd_mu + delta_d * tdd_sd), ecc_mu, nd_mu]
     E = [tdd_mu + delta_e * tdd_sd, ecc_mu, nd_mu]
@@ -233,44 +179,54 @@ function test()
     isdir(base) || mkdir(base)
 
 
-    df = DataFrame(:scene => Int32[],
-                   :epoch => Int32[],
+    df = DataFrame(:scene => UInt8[],
+                   :frame => UInt32[],
                    :tdd => Float32[],
                    :ecc => Float32[],
                    :nobj => Float32[]
                    )
 
-    perm = [E, E, D]
-    ne = length(perm)
-    itargets = repeat(perm, inner = epoch_frames)
-    ftargets = repeat(E, inner = epoch_frames)
+
+    part_a_end = Int(4 * epoch_frames)
+
+    targets = repeat(hcat(E,E,D,E,E), inner = (1, epoch_frames))
+    targets[1, :] = smooth(targets[1, :], fps)
 
     trial = 1
     for i = 1:pairs
-        targets = repeat(perm, inner = epoch_frames)
-        part_a, vals_a = gen_trial(wm, targets, metrics, 5000)
+        trace, part_a, _ = gen_trial(wm, targets[:, 1:part_a_end],
+                                          metrics, 20, 300)
         # extend with two Easy segments
-        part_b, vals_b = extend_trial(wm, part_a,
-                                      fill(E, 2 * epoch_frames),
-                                      metrics, 5000)
+        part_b, vals = extend_trial(trace, part_a_end, wm,
+                                      targets,
+                                      metrics, 20, 300)
 
         push!(dataset, part_a)
         push!(cond_list, [trial, false])
 
-        push!(dataset, [part_a; part_b])
+        push!(dataset, part_b)
         push!(cond_list, [trial + 1, false])
 
         trial += 2
 
         d = Dict(:scene => i,
-                 :epoch => 1:5)
+                 :frame => 1:tot_frames)
 
-        vals = hcat(vals_a, vals_b)
         for (mi, m) = enumerate(metrics.names)
-            vs = reshape(vals[mi, :], (epoch_frames, 5))
-            d[m] = vec(mean(vs, dims = 1))
+            vs = map(x -> x[mi], vals)
+            d[m] = vs
+            ylim = (min(minimum(vs), D[mi]), E[mi])
+            plt = lineplot(1:tot_frames,
+                           targets[mi, :],
+                           title = String(m),
+                           xlabel = "time",
+                           name = "target",
+                           ylim = ylim
+                           )
+            lineplot!(plt, 1:tot_frames, vs, name = "measured")
+            vline!(plt, part_a_end)
+            display(plt)
         end
-        display(d)
         append!(df, d)
     end
     write_dataset(dataset, "$(base)/dataset.json")
@@ -279,8 +235,8 @@ function test()
 
     examples = []
     for i = 1:pairs
-        targets = repeat(perm, inner = epoch_frames)
-        part_a, vals_a = gen_trial(wm, targets, metrics, 5000)
+        _, part_a, _ = gen_trial(wm, targets[:, 1:part_a_end],
+                                   metrics, 20, 100)
         push!(examples, part_a)
     end
     write_dataset(examples, "$(base)/examples.json")
