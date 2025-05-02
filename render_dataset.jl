@@ -16,7 +16,7 @@ targets = [true, true, true, true, false, false, false, false]
 
 
 function main()
-    dname = "shifting_peak_1"
+    dname = "shifting_peak_2"
     local dataset
     open("output/$(dname)/dataset.json", "r") do f
         dataset = JSON.parse(f)

@@ -88,7 +88,7 @@ end
 function test()
 
     dname = "shifting_peak"
-    version = "1"
+    version = "3"
 
     wm = SchollWM(;
                   n_dots=8,
@@ -105,10 +105,10 @@ function test()
     # dataset parameters
     nscenes = 10
     ntrials = nscenes * 2
-    nexamples = 4
+    nexamples = 3
     fps = 24 # frames per second
-    epoch_frames = 60 #
-    tot_frames = 7 * epoch_frames # 6 epochs per trial (15s)
+    epoch_frames = 24 # each epoch = 1s
+    tot_frames = 20 * epoch_frames # 20s blue print - cut to 15s trials
 
 
     metrics = Metrics(
@@ -126,7 +126,7 @@ function test()
 
     delta_h = -3.5
     delta_e = 3.0
-    delta_m = 0.5 * delta_h
+    delta_m = 0.50 * delta_h
 
     H = [max(0.0, tdd_mu + delta_h * tdd_sd); ecc_mu; nd_mu]
     M = [tdd_mu + delta_m * tdd_sd; ecc_mu; nd_mu]
@@ -143,12 +143,24 @@ function test()
     base = "output/$(dname)_$(version)"
     isdir(base) || mkdir(base)
 
+
+    # 1 second bin example:
+    # E E E E E E E H E E E E E E E E E E E E
+    #           E E H E E E E E E E E E E E E
+    # E E E E E E E H E E E E E E E
+
+    cutoff = fps * 5 # remove 5s from start or end
+
     window = 12
-    hard_epochs = hcat(E, E, H, E, E, E, E)
+    hard_epochs = hcat(
+        E, E, E, E, E, E, E, H, H, H, E, E, E, E, E, E, E, E, E, E
+    )
     hard_targets = repeat(hard_epochs, inner = (1, epoch_frames))
     hard_targets[1, :] = smooth(hard_targets[1, :], window)
 
-    moderate_epochs = hcat(E, E, M, E, E, E, E)
+    moderate_epochs = hcat(
+        E, E, E, E, E, E, E, M, M, M, E, E, E, E, E, E, E, E, E, E
+    )
     moderate_targets = repeat(moderate_epochs, inner = (1, epoch_frames))
     moderate_targets[1, :] = smooth(moderate_targets[1, :], window)
 
@@ -163,18 +175,16 @@ function test()
 
     for i = 1:nscenes
 
-
         targets = iseven(i) ? moderate_targets : hard_targets
 
         trace, src_frames, vals =
             gen_trial(wm, targets, metrics, 20, 100)
 
-        # E H E E E E
-        earlier = src_frames[1:(tot_frames - epoch_frames)]
+        earlier = src_frames[(cutoff+1):end]
         push!(dataset, earlier)
         push!(cond_list, [(i - 1) * 2 + 1, false])
-        # E E H E E E
-        later   = src_frames[(epoch_frames):end]
+
+        later = src_frames[1:(tot_frames - cutoff)]
         push!(dataset, later)
         push!(cond_list, [i * 2, false])
 
