@@ -88,7 +88,7 @@ end
 function test()
 
     dname = "shifting_peak"
-    version = "3"
+    version = "4"
 
     wm = SchollWM(;
                   n_dots=8,
@@ -107,8 +107,9 @@ function test()
     ntrials = nscenes * 2
     nexamples = 3
     fps = 24 # frames per second
-    epoch_frames = 24 # each epoch = 1s
-    tot_frames = 20 * epoch_frames # 20s blue print - cut to 15s trials
+    delta_time = round(Int64, 3 * fps)
+    trial_frames = round(Int64, 15 * fps)
+    tot_frames = delta_time + trial_frames # 18s blue print - cut to 15s trials
 
 
     metrics = Metrics(
@@ -143,25 +144,16 @@ function test()
     base = "output/$(dname)_$(version)"
     isdir(base) || mkdir(base)
 
-
-    # 1 second bin example:
-    # E E E E E E E H E E E E E E E E E E E E
-    #           E E H E E E E E E E E E E E E
-    # E E E E E E E H E E E E E E E
-
-    cutoff = fps * 5 # remove 5s from start or end
-
+    peak_start = delta_time + round(Int64, 2.5 * fps) # starts at 2.5s
+    peak_dur = round(Int64, 2.5 * fps) # lasts 2.5s
     window = 12
-    hard_epochs = hcat(
-        E, E, E, E, E, E, E, H, H, H, E, E, E, E, E, E, E, E, E, E
-    )
-    hard_targets = repeat(hard_epochs, inner = (1, epoch_frames))
+
+    hard_targets = repeat(E, inner = (1, tot_frames))
+    hard_targets[:, peak_start:(peak_start+peak_dur)] .= H
     hard_targets[1, :] = smooth(hard_targets[1, :], window)
 
-    moderate_epochs = hcat(
-        E, E, E, E, E, E, E, M, M, M, E, E, E, E, E, E, E, E, E, E
-    )
-    moderate_targets = repeat(moderate_epochs, inner = (1, epoch_frames))
+    moderate_targets = repeat(E, inner = (1, tot_frames))
+    moderate_targets[:, peak_start:(peak_start+peak_dur)] .= M
     moderate_targets[1, :] = smooth(moderate_targets[1, :], window)
 
 
@@ -180,15 +172,13 @@ function test()
         trace, src_frames, vals =
             gen_trial(wm, targets, metrics, 20, 100)
 
-        earlier = src_frames[(cutoff+1):end]
+        earlier = src_frames[(delta_time+1):end]
         push!(dataset, earlier)
         push!(cond_list, [(i - 1) * 2 + 1, false])
 
-        later = src_frames[1:(tot_frames - cutoff)]
+        later = src_frames[1:(tot_frames - delta_time)]
         push!(dataset, later)
         push!(cond_list, [i * 2, false])
-
-
 
         d = Dict(:scene => i,
                  :frame => 1:tot_frames)
@@ -222,8 +212,8 @@ function test()
 
     for i = 1:nexamples
         _, trial, vals = gen_trial(wm, hard_targets, metrics, 20, 100)
-        trial = iseven(i) ? trial[1:(tot_frames - epoch_frames)] :
-            trial[epoch_frames:end]
+        trial = iseven(i) ? trial[1:(tot_frames - delta_time)] :
+            trial[(delta_time + 1):end]
         push!(examples, trial)
     end
     write_dataset(examples, "$(base)/examples.json")
