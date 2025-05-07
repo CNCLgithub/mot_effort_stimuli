@@ -36,7 +36,8 @@ function gen_trial(wm::SchollWM, targets,
             for _ = 1:rejuv_steps
                 new_tr, w = regenerate(pf.traces[p],
                                     Gen.select(:states => i => :deltas => obj))
-                if log(rand()) < w
+                # if log(rand()) < w
+                if w > 0.0
                     pf.traces[p] = new_tr
                     pf.log_weights[p] += w
                 end
@@ -85,19 +86,37 @@ end
     return result
 end
 
+
+function tdminavg(state::SchollState)
+    # first 4 are targets
+    objects = state.objects
+    tdd = 0.0
+    @inbounds for i = 1:4
+        tpos = get_pos(objects[i])
+        _tdd = Inf
+        for j = 5:8
+            # REVIEW: consider l1 distance
+            d = norm(tpos - get_pos(objects[j]))
+            _tdd = min(_tdd, d)
+        end
+        tdd += min(_tdd, 200.0)
+    end
+    0.25 * tdd
+end
+
 function test()
 
     dname = "shifting_peak"
-    version = "4"
+    version = "7"
 
     wm = SchollWM(;
                   n_dots=8,
                   area_width = 720.0,
                   area_height = 480.0,
                   dot_radius = 20.0,
-                  vel=3.0,
+                  vel=2.75,
                   vel_min = 2.0,
-                  vel_max = 4.0,
+                  vel_max = 3.75,
                   vel_step = 1.00,
                   vel_prob = 0.20
     )
@@ -109,12 +128,17 @@ function test()
     fps = 24 # frames per second
     delta_time = round(Int64, 3 * fps)
     trial_frames = round(Int64, 15 * fps)
-    tot_frames = delta_time + trial_frames # 18s blue print - cut to 15s trials
+    burnin = 1 * fps
+    tot_frames = burnin + delta_time + trial_frames # 18s blue print - cut to 15s trials
 
 
     metrics = Metrics(
-        [tddensity, eccentricity, nearest_obj],
-        [:tdd, :ecc, :nobj]
+        [tddensity, eccentricity, x -> nearest_obj(x, 90.0),
+         # x -> min(tdmin(x), 100.0)
+         ],
+        [:tdd, :ecc, :nobj,
+         # :tdm
+         ]
     )
     nm = length(metrics.funcs)
 
@@ -123,15 +147,21 @@ function test()
 
     tdd_mu, tdd_sd = stats[:tdd]
     ecc_mu, _ = stats[:ecc]
-    nd_mu = 50.0
+    nd_mu = 90.0
 
-    delta_h = -3.5
-    delta_e = 3.0
-    delta_m = 0.50 * delta_h
+    delta_h = -3.0
+    delta_e = 3.5
+    delta_m = 0.5 * (delta_h + delta_e)
 
-    H = [max(0.0, tdd_mu + delta_h * tdd_sd); ecc_mu; nd_mu]
-    M = [tdd_mu + delta_m * tdd_sd; ecc_mu; nd_mu]
-    E = [tdd_mu + delta_e * tdd_sd; ecc_mu; nd_mu]
+    H = [tdd_mu + delta_h * tdd_sd; ecc_mu; nd_mu;
+         # 100.0
+         ]
+    M = [tdd_mu + delta_m * tdd_sd; ecc_mu; nd_mu;
+         # 100.0
+         ]
+    E = [tdd_mu + delta_e * tdd_sd; ecc_mu; nd_mu;
+         # 100.0
+         ]
 
     @show stats
     @show H
@@ -144,9 +174,10 @@ function test()
     base = "output/$(dname)_$(version)"
     isdir(base) || mkdir(base)
 
-    peak_start = delta_time + round(Int64, 2.5 * fps) # starts at 2.5s
-    peak_dur = round(Int64, 2.5 * fps) # lasts 2.5s
-    window = 12
+    # starts at 2.5s
+    peak_start = burnin + delta_time + round(Int64, 2.5 * fps)
+    peak_dur = round(Int64, 2.5 * fps) # duration of peak in seconds
+    window = 24
 
     hard_targets = repeat(E, inner = (1, tot_frames))
     hard_targets[:, peak_start:(peak_start+peak_dur)] .= H
@@ -162,40 +193,45 @@ function test()
                    :frame => UInt32[],
                    :tdd => Float32[],
                    :ecc => Float32[],
-                   :nobj => Float32[]
+                   :nobj => Float32[],
+                   # :tdm => Float32[],
                    )
 
     for i = 1:nscenes
 
         targets = iseven(i) ? moderate_targets : hard_targets
-
         trace, src_frames, vals =
             gen_trial(wm, targets, metrics, 20, 100)
+
+        # remove burnin
+        src_frames = src_frames[(burnin+1):end]
+        vals = vals[(burnin+1):end]
 
         earlier = src_frames[(delta_time+1):end]
         push!(dataset, earlier)
         push!(cond_list, [(i - 1) * 2 + 1, false])
 
-        later = src_frames[1:(tot_frames - delta_time)]
+        later = src_frames[1:(tot_frames - delta_time - burnin)]
         push!(dataset, later)
         push!(cond_list, [i * 2, false])
 
         d = Dict(:scene => i,
-                 :frame => 1:tot_frames)
+                 :frame => 1:(tot_frames - burnin))
 
         for (mi, m) = enumerate(metrics.names)
             vs = map(x -> x[mi], vals)
             d[m] = vs
-            plt = lineplot(1:tot_frames,
-                           targets[mi, :],
-                           title = String(m),
-                           xlabel = "time",
-                           name = "target",
-                           ylim = (min(minimum(vs), H[mi]), E[mi])
-                           )
-            lineplot!(plt, 1:tot_frames, vs, name = "measured")
-
             if m == :tdd
+                plt = lineplot(
+                    1:(tot_frames - burnin),
+                    targets[mi, (burnin+1):end],
+                    title = String(m),
+                    xlabel = "time",
+                    name = "target",
+                    ylim = (H[mi]-1.0, E[mi]+1.0)
+                )
+                lineplot!(plt, 1:(tot_frames-burnin), vs,
+                          name = "measured")
                 display(plt)
             end
         end
@@ -212,8 +248,8 @@ function test()
 
     for i = 1:nexamples
         _, trial, vals = gen_trial(wm, hard_targets, metrics, 20, 100)
-        trial = iseven(i) ? trial[1:(tot_frames - delta_time)] :
-            trial[(delta_time + 1):end]
+        trial = iseven(i) ? trial[1:(tot_frames - delta_time - burnin)] :
+            trial[(burnin + delta_time + 1):end]
         push!(examples, trial)
     end
     write_dataset(examples, "$(base)/examples.json")

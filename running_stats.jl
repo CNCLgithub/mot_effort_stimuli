@@ -75,7 +75,7 @@ function eccentricity(state::SchollState)
     2 * (val / no)
 end
 
-function nearest_obj(state::SchollState)
+function nearest_obj(state::SchollState, dmax::Float64 = 45.0)
     objects = state.objects
     d = Inf
     @inbounds for i = 1:7
@@ -84,7 +84,7 @@ function nearest_obj(state::SchollState)
             d = min(norm(tpos - get_pos(objects[j])), d)
         end
     end
-    clamp(d, 0., 45.) # prevent over-correction
+    min(d, dmax)
 end
 
 function tddensity(state::SchollState)
