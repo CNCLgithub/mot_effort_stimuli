@@ -150,6 +150,19 @@ end
     return result
 end
 
+
+function nearest_obj(state::SchollState, dmax::Float64 = 45.0)
+    objects = state.objects
+    d = Inf
+    @inbounds for i = 1:7
+        tpos = get_pos(objects[i])
+        for j = (i+1):8
+            d = min(norm(tpos - get_pos(objects[j])), d)
+        end
+    end
+    min(d, dmax)
+end
+
 function test()
 
     dname = "peak"
