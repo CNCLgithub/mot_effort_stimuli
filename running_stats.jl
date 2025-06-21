@@ -1,9 +1,12 @@
 using Statistics
 using StaticArrays
 using Statistics: mean
-using LinearAlgebra: norm
+using LinearAlgebra: norm, normalize
 using Accessors: setproperties
-using MOTCore: scholl_delta, scholl_init
+using MOTCore: scholl_delta, scholl_init, SchollState
+
+
+const S2V = SVector{2, Float64}
 
 ################################################################################
 # Metrics
@@ -18,6 +21,14 @@ struct Metrics
         new(fs, ns)
     end
 end
+
+function Metrics(;kwargs...)
+    Metrics(collect(values(kwargs)), collect(keys(kwargs)))
+end
+
+import Base.length
+Base.length(ms::Metrics) = length(ms.funcs)
+
 
 function (ms::Metrics)(args::Tuple)
     n = length(ms.funcs)
@@ -51,6 +62,12 @@ function stride!(stats::RunningStats, ms::Metrics, args::Tuple)
     stats.c += 1
 end
 
+function report(states::Vector{SchollState}, ms::Metrics)
+    stats = RunningStats(ms)
+    stride!(stats, ms, (states,))
+    report(stats, ms)
+end
+
 function report(stats::RunningStats, ms::Metrics)
     n = length(ms.funcs)
     mus = Vector{Float64}(undef, n)
@@ -75,7 +92,7 @@ function eccentricity(state::SchollState)
     2 * (val / no)
 end
 
-function nearest_obj(state::SchollState, dmax::Float64 = 45.0)
+function nearest_obj(state::SchollState)
     objects = state.objects
     d = Inf
     @inbounds for i = 1:7
@@ -84,7 +101,7 @@ function nearest_obj(state::SchollState, dmax::Float64 = 45.0)
             d = min(norm(tpos - get_pos(objects[j])), d)
         end
     end
-    min(d, dmax)
+    return d
 end
 
 function tddensity(state::SchollState)
@@ -92,7 +109,6 @@ function tddensity(state::SchollState)
     objects = state.objects
     avg_tdd = 0.0
     @inbounds for i = 1:4
-        tdd = Inf
         tpos = get_pos(objects[i])
         for j = 5:8
             d = norm(tpos - get_pos(objects[j]))
@@ -135,6 +151,17 @@ function smooth(xs::Vector{Float64}, w::Int64)
         ys[i] *= 1.0 / c
     end
     return ys
+end
+
+function vec2_angle(a::SVector{2, Float64}, b::SVector{2, Float64})
+    a = normalize(a)
+    b = normalize(b)
+    y = a - b
+    x = a + b
+
+    a = 2 * atan(norm(y), norm(x))
+
+    !(signbit(a) || signbit(pi - a)) ? a : (signbit(a) ? 0.0 : pi)
 end
 
 ################################################################################
