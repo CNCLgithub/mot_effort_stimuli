@@ -35,3 +35,5 @@ In the `/output` folder, each run of an experiment script will generate the foll
 The `dataset.json` file consists of a list of trials.
 Each trial contains an entry of `positions`, which contains list of time points. 
 Each time point is a list of 2D points (one for each object). 
+
+The `examples.json` file contains the same format, but with fewer animations (usually only 3-4).
