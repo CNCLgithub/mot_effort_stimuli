@@ -62,9 +62,18 @@ function stride!(stats::RunningStats, ms::Metrics, args::Tuple)
     stats.c += 1
 end
 
-function report(states::Vector{SchollState}, ms::Metrics)
+function chunk_array(arr::AbstractVector, N)
+    chunked = map(Iterators.partition(axes(arr,1),N)) do chunk
+        @view arr[chunk] # remove @view if you want copies that do not alias `arr`
+    end
+    return chunked
+end
+
+function report(states::AbstractVector, ms::Metrics)
     stats = RunningStats(ms)
-    stride!(stats, ms, (states,))
+    for chunk = chunk_array(states, 10)
+        stride!(stats, ms, (chunk,))
+    end
     report(stats, ms)
 end
 
@@ -80,7 +89,7 @@ function report(stats::RunningStats, ms::Metrics)
     Dict{Symbol, Tuple}(zip(ms.names, zip(mus, sds)))
 end
 
-function eccentricity(state::SchollState)
+function eccentricity(state)
     # first 4 are targets
     objects = state.objects
     no = length(objects)
@@ -104,7 +113,7 @@ function nearest_obj(state::SchollState)
     return d
 end
 
-function tddensity(state::SchollState)
+function tddensity(state)
     # first 4 are targets
     objects = state.objects
     avg_tdd = 0.0
@@ -169,7 +178,7 @@ end
 ################################################################################
 
 
-function trial_to_dict(states::AbstractVector{T}) where {T<:SchollState}
+function trial_to_dict(states::AbstractVector)
     positions = map(states) do state
         map(state.objects) do dot
             get_pos(dot)
